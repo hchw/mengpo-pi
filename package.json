@@ -1,0 +1,36 @@
+{
+  "name": "mengpo-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mengpo memory adapter for pi: scenario-triggered recall and Level 2 runtime trace reporting.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "Apache-2.0",
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}
