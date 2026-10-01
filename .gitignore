@@ -1,0 +1,7 @@
+# 依赖与构建产物（永不提交）
+/node_modules/
+
+# OpenSpec 规划制品：与 Mengpo 仓库保持一致，只保留在本地
+openspec/
+.codegraph
+.pi
