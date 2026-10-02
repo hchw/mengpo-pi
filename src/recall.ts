@@ -40,6 +40,48 @@ export interface RecallInput {
 
 export const REPEATED_FAILURE_THRESHOLD = 2;
 
+/**
+ * Phrases that mean the user is explicitly asking to revisit earlier
+ * experience. This is a heuristic, not a classifier: a false positive costs one
+ * extra recall round-trip (the service still chooses depth), while a false
+ * negative only loses a label because a new user input recalls anyway. The
+ * matching is intentionally narrow to avoid firing on ordinary narration.
+ */
+const EXPLICIT_RECALL_PATTERNS: RegExp[] = [
+	/回忆/,
+	/回顾/,
+	/还记得/,
+	/记不记得/,
+	/记得吗/,
+	/以前(?:怎么|为什|如何|做过|说过|用|是)/,
+	/之前(?:怎么|为什|如何|做过|说过|我们|是)/,
+	/上次(?:怎么|为什|如何|我们|是)/,
+	/\brecall\b/i,
+	/\bremember\b/i,
+	/\blast time\b/i,
+	/\bpreviously\b/i,
+];
+
+/** detectExplicitRecall decides whether the prompt directly asks for memory. */
+export function detectExplicitRecall(prompt: string): boolean {
+	const text = prompt.trim();
+	if (text === "") {
+		return false;
+	}
+	return EXPLICIT_RECALL_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * detectTaskSwitch reports a working-context move. Only an observable change is
+ * treated as a switch; an absent cwd is never assumed to be a different one.
+ */
+export function detectTaskSwitch(previousCwd: string | undefined, currentCwd: string | undefined): boolean {
+	if (!previousCwd || !currentCwd) {
+		return false;
+	}
+	return previousCwd !== currentCwd;
+}
+
 export function decideRecall(input: RecallInput): RecallDecision {
 	if (input.inputsUnavailable) {
 		// Never stop recalling because the decision itself could not be made.
@@ -48,11 +90,13 @@ export function decideRecall(input: RecallInput): RecallDecision {
 	if (input.userRequestedRecall) {
 		return { recall: true, trigger: "explicit-request", reason: "user asked to revisit earlier experience" };
 	}
+	if (input.taskSwitched) {
+		// A context move is a stronger signal than a bare continuation, so it is
+		// labelled before the generic new-input case.
+		return { recall: true, trigger: "task-switch", reason: "the working task changed" };
+	}
 	if (input.hasNewUserInput) {
 		return { recall: true, trigger: "new-user-request", reason: "turn starts from new user input" };
-	}
-	if (input.taskSwitched) {
-		return { recall: true, trigger: "task-switch", reason: "the working task changed" };
 	}
 	if (input.consecutiveFailures >= REPEATED_FAILURE_THRESHOLD) {
 		return { recall: true, trigger: "repeated-failures", reason: `${input.consecutiveFailures} consecutive failures` };

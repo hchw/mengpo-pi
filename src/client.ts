@@ -7,7 +7,6 @@
  */
 
 import { buildEnvelope, type Envelope, type MemoryHint, type ScopeType } from "./envelope.ts";
-import { stripProjection, type Trace } from "./trace.ts";
 
 export interface ClientOptions {
 	baseUrl: string;
@@ -150,29 +149,19 @@ export class MemoryClient {
 	}
 
 	async observe(request: ObserveRequest): Promise<{ eventId: string; created: boolean }> {
-		const payload = request.payload;
 		try {
 			const response = (await this.command("observe", request)) as { event_id?: string; created?: boolean };
 			return { eventId: response.event_id ?? "", created: response.created ?? false };
 		} catch (error) {
-			// A server that predates trace fields rejects the whole request. The
-			// observation still has value without them, so drop the trace once
-			// instead of letting the reporting path stay broken.
-			if (isUnknownFieldRejection(error) && hasTrace(payload)) {
-				const retryPayload: Record<string, unknown> = {};
-				for (const [key, value] of Object.entries(payload)) {
-					if (key !== "trace") {
-						retryPayload[key] = value;
-					}
-				}
-				const strippedTrace = stripProjection((payload.trace ?? {}) as Trace);
-				if (!isEmptyPayloadTrace(strippedTrace)) {
-					retryPayload.trace = strippedTrace;
-				}
-				const response = (await this.command("observe", { ...request, payload: retryPayload })) as {
-					event_id?: string;
-					created?: boolean;
-				};
+			// A server that predates the deep-runtime ingress rejects the whole
+			// request on its new fields. The observation still has value without
+			// them, so retry once in the pre-ingress shape instead of letting the
+			// reporting path stay broken.
+			if (isUnknownFieldRejection(error) && hasIngressObserveFields(request.payload)) {
+				const response = (await this.command("observe", {
+					...request,
+					payload: toLegacyObservePayload(request.payload),
+				})) as { event_id?: string; created?: boolean };
 				return { eventId: response.event_id ?? "", created: response.created ?? false };
 			}
 			throw error;
@@ -180,25 +169,17 @@ export class MemoryClient {
 	}
 
 	async project(request: ProjectRequest): Promise<ProjectionResult> {
-		const response = (await this.command("project", request)) as {
-			projection_id?: string;
-			items?: Array<{ Candidate?: { Node?: { ID?: string } }; Text?: string }>;
-			metadata?: { mode?: string; degraded?: boolean };
-		};
-		const items: ProjectionItem[] = [];
-		for (const item of response.items ?? []) {
-			const text = item.Text ?? "";
-			if (text.trim() === "") {
-				continue;
+		try {
+			return parseProjection(await this.command("project", request));
+		} catch (error) {
+			// A server that predates the scenario entry rejects the field and would
+			// lose the whole recall. Drop it once: depth then falls back to the
+			// service default, which is still useful.
+			if (isUnknownFieldRejection(error) && request.scenario && Object.keys(request.scenario).length > 0) {
+				return parseProjection(await this.command("project", { ...request, scenario: undefined }));
 			}
-			items.push({ text, memoryId: item.Candidate?.Node?.ID ?? "" });
+			throw error;
 		}
-		return {
-			projectionId: response.projection_id,
-			items,
-			mode: response.metadata?.mode ?? "unknown",
-			degraded: response.metadata?.degraded ?? false,
-		};
 	}
 
 	async feedback(request: FeedbackRequest): Promise<void> {
@@ -308,20 +289,54 @@ function commandPath(operation: "observe" | "project" | "feedback" | "session"):
 	return operation === "session" ? "sessions" : operation;
 }
 
-function pickTenant(tenants: Array<{ id?: string; active?: boolean }> | undefined): string {	if (!tenants || tenants.length === 0) {
+function pickTenant(tenants: Array<{ id?: string; active?: boolean }> | undefined): string {
+	if (!tenants || tenants.length === 0) {
 		return "";
 	}
 	const active = tenants.find((tenant) => tenant.active);
 	return (active ?? tenants[0]).id ?? "";
 }
 
-function hasTrace(payload: Record<string, unknown>): boolean {
-	const trace = payload.trace;
-	return typeof trace === "object" && trace !== null && Object.keys(trace as Record<string, unknown>).length > 0;
+/** Fields introduced with the deep-runtime ingress; absent on older servers. */
+const INGRESS_OBSERVE_FIELDS = ["source_type", "sequence", "parent_event_id", "trace"] as const;
+
+function hasIngressObserveFields(payload: Record<string, unknown>): boolean {
+	return INGRESS_OBSERVE_FIELDS.some((field) => field in payload);
 }
 
-function isEmptyPayloadTrace(trace: unknown): boolean {
-	return typeof trace !== "object" || trace === null || Object.keys(trace as Record<string, unknown>).length === 0;
+/** toLegacyObservePayload keeps only fields a pre-ingress server understands. */
+function toLegacyObservePayload(payload: Record<string, unknown>): Record<string, unknown> {
+	const legacy: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(payload)) {
+		if ((INGRESS_OBSERVE_FIELDS as readonly string[]).includes(key)) {
+			continue;
+		}
+		legacy[key] = value;
+	}
+	return legacy;
+}
+
+/** parseProjection maps the service response body onto the projection shape. */
+function parseProjection(response: unknown): ProjectionResult {
+	const body = response as {
+		projection_id?: string;
+		items?: Array<{ Candidate?: { Node?: { ID?: string } }; Text?: string }>;
+		metadata?: { mode?: string; degraded?: boolean };
+	};
+	const items: ProjectionItem[] = [];
+	for (const item of body.items ?? []) {
+		const text = item.Text ?? "";
+		if (text.trim() === "") {
+			continue;
+		}
+		items.push({ text, memoryId: item.Candidate?.Node?.ID ?? "" });
+	}
+	return {
+		projectionId: body.projection_id,
+		items,
+		mode: body.metadata?.mode ?? "unknown",
+		degraded: body.metadata?.degraded ?? false,
+	};
 }
 
 function isUnknownFieldRejection(error: unknown): boolean {

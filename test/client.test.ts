@@ -66,7 +66,7 @@ test("a session-scoped observe carries the bound session in its scope", async ()
 	assert.equal(call?.body.principal.type, "user");
 });
 
-test("a rejection of trace fields degrades to a report without them", async () => {
+test("a rejection of ingress fields degrades to a pre-ingress report", async () => {
 	let attempts = 0;
 	const { client, fake } = newClient({
 		handler: (path, call) => {
@@ -85,14 +85,60 @@ test("a rejection of trace fields degrades to a report without them", async () =
 		scopeType: "session",
 		sessionId: "session-1",
 		idempotencyKey: "idem-trace",
-		payload: { trace: { projection_id: "projection-1", tool_result_id: "call-1" }, source_type: "tool" },
+		payload: {
+			source_event_id: "node-e1",
+			source_type: "tool",
+			message_type: "tool.failure",
+			sequence: 3,
+			parent_event_id: "e1",
+			text: "boom",
+			payload: { outcome: "error" },
+			trace: { projection_id: "projection-1", tool_result_id: "call-1" },
+		},
 	});
 	assert.equal(result.eventId, "event-2");
 	const observeCalls = fake.calls.filter((call) => call.url.endsWith("/api/v1/observe"));
 	assert.equal(observeCalls.length, 2);
-	assert.equal(observeCalls[0]?.body.payload.trace.projection_id, "projection-1");
-	assert.equal("projection_id" in observeCalls[1]!.body.payload.trace, false);
-	assert.equal(observeCalls[1]?.body.payload.trace.tool_result_id, "call-1");
+	const first = observeCalls[0]!.body.payload;
+	assert.equal(first.source_type, "tool");
+	assert.equal(first.trace.projection_id, "projection-1");
+	const second = observeCalls[1]!.body.payload;
+	assert.equal("trace" in second, false);
+	assert.equal("source_type" in second, false);
+	assert.equal("sequence" in second, false);
+	assert.equal("parent_event_id" in second, false);
+	assert.equal(second.source_event_id, "node-e1");
+	assert.equal(second.message_type, "tool.failure");
+	assert.equal(second.text, "boom");
+	assert.deepEqual(second.payload, { outcome: "error" });
+});
+
+test("a rejection of the scenario field degrades to a recall without it", async () => {
+	let attempts = 0;
+	const { client, fake } = newClient({
+		handler: (path, call) => {
+			if (path === "/api/v1/project") {
+				attempts += 1;
+				if (attempts === 1) {
+					return jsonResponse({ status: 400, error: { code: "INVALID_ENVELOPE", message: "unknown field scenario" } });
+				}
+			}
+			return defaultServer()(path, call);
+		},
+	});
+	await client.bindSession("pi-session-1", "demo");
+	const result = await client.project({
+		scopeType: "session",
+		sessionId: "session-1",
+		idempotencyKey: "idem-scenario",
+		query: "q",
+		scenario: { repeated_failures: 2 },
+	});
+	assert.equal(result.projectionId, "projection-1");
+	const projectCalls = fake.calls.filter((call) => call.url.endsWith("/api/v1/project"));
+	assert.equal(projectCalls.length, 2);
+	assert.deepEqual(projectCalls[0]!.body.payload.scenario, { repeated_failures: 2 });
+	assert.equal("scenario" in projectCalls[1]!.body.payload, false);
 });
 
 test("a rejection that is not about unknown fields is surfaced", async () => {

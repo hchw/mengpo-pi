@@ -131,7 +131,7 @@ test("injected memory is marked on later observations so it cannot reinforce its
 	await bridge.recall({ hasNewUserInput: true, query: "q" });
 	await bridge.reportTurnOutcome({ note: { turnId: "turn-1", entryId: "entry-1" }, outcomeId: "outcome-1", summary: "done", failed: false });
 	const payload = observeBodies(fake)[0];
-	assert.deepEqual(payload.mengpo_injected_memory_ids, ["memory-1"]);
+	assert.deepEqual(payload.payload.mengpo_injected_memory_ids, ["memory-1"]);
 });
 
 test("a projection reference is attached to later events of the same turn", async () => {

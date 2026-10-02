@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildScenarioSignals, decideRecall, REPEATED_FAILURE_THRESHOLD } from "../src/recall.ts";
+import { buildScenarioSignals, decideRecall, detectExplicitRecall, detectTaskSwitch, REPEATED_FAILURE_THRESHOLD } from "../src/recall.ts";
 
 function base(overrides: Partial<Parameters<typeof decideRecall>[0]> = {}) {
 	return {
@@ -38,9 +38,35 @@ test("repeated failures re-trigger recall", () => {
 });
 
 test("a task switch and an explicit request both recall", () => {
-	assert.equal(decideRecall(base({ taskSwitched: true })).recall, true);
+	const taskSwitch = decideRecall(base({ taskSwitched: true }));
+	assert.equal(taskSwitch.recall && taskSwitch.trigger, "task-switch");
 	const explicit = decideRecall(base({ userRequestedRecall: true }));
 	assert.equal(explicit.recall && explicit.trigger, "explicit-request");
+});
+
+test("a task switch is labelled ahead of a generic new input", () => {
+	const decision = decideRecall(base({ taskSwitched: true, hasNewUserInput: true }));
+	assert.equal(decision.recall && decision.trigger, "task-switch");
+});
+
+test("an explicit request is labelled ahead of a task switch", () => {
+	const decision = decideRecall(base({ taskSwitched: true, hasNewUserInput: true, userRequestedRecall: true }));
+	assert.equal(decision.recall && decision.trigger, "explicit-request");
+});
+
+test("explicit recall phrases are recognised, ordinary narration is not", () => {
+	assert.equal(detectExplicitRecall("回忆一下上次是怎么改的"), true);
+	assert.equal(detectExplicitRecall("你还记得我们用 pgvector 的原因吗"), true);
+	assert.equal(detectExplicitRecall("recall what we decided last time"), true);
+	assert.equal(detectExplicitRecall("帮我把这个函数重命名"), false);
+	assert.equal(detectExplicitRecall(""), false);
+});
+
+test("a task switch needs two observable, different directories", () => {
+	assert.equal(detectTaskSwitch("/repo/a", "/repo/b"), true);
+	assert.equal(detectTaskSwitch("/repo/a", "/repo/a"), false);
+	assert.equal(detectTaskSwitch(undefined, "/repo/a"), false);
+	assert.equal(detectTaskSwitch("/repo/a", undefined), false);
 });
 
 test("new evidence recalls even on an otherwise quiet turn", () => {

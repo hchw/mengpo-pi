@@ -70,8 +70,6 @@ function assign(target: Trace, key: keyof Trace, value: string | undefined): voi
 export const EVENT_TYPES = {
 	toolResult: "tool.result",
 	toolFailure: "tool.failure",
-	assistantMessage: "message",
-	userMessage: "message",
 	turnOutcome: "turn.outcome",
 	userCorrection: "user_correction",
 	userRemember: "user_remember",

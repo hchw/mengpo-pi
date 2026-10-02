@@ -241,3 +241,116 @@ test("the memory command reports state in interactive mode and stays silent othe
 	// A non-interactive mode has no UI to report to; the command must not fail.
 	await handler!("", fakeContext({ hasUI: false, ui: undefined, mode: "json" }));
 });
+
+test("recall and injection are announced to the person", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	const notifications: string[] = [];
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: "dev@mengpo.local" },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext({ hasUI: true, ui: { notify: (line: string) => notifications.push(line) } });
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+				const sections: Record<string, string> = {};
+				await pi.emit(
+					"before_agent_start",
+					{ type: "before_agent_start", prompt: "what failed?", systemPromptOptions: { sections } },
+					ctx,
+				);
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+	assert.equal(notifications.some((line) => /记忆获取 1 条/.test(line)), true);
+	assert.equal(notifications.some((line) => /记忆注入 1 条/.test(line)), true);
+});
+
+test("a working-directory change is announced as a task switch", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	const notifications: string[] = [];
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: "dev@mengpo.local" },
+			async () => {
+				const pi = fakePi();
+				const ctx = (cwd: string) =>
+					fakeContext({ cwd, hasUI: true, ui: { notify: (line: string) => notifications.push(line) } });
+				await pi.emit("session_start", { type: "session_start" }, ctx("/repo/a"));
+				await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "first task", systemPromptOptions: { sections: {} } }, ctx("/repo/a"));
+				await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "second task", systemPromptOptions: { sections: {} } }, ctx("/repo/b"));
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+	assert.equal(notifications.some((line) => /触发=任务切换/.test(line)), true);
+});
+
+test("reported turn events carry real session entry parents and ordering", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: "dev@mengpo.local" },
+			async () => {
+				const pi = fakePi();
+				const branch = [
+					{ id: "e0", parentId: null },
+					{ id: "e1", parentId: "e0" },
+					{ id: "e2", parentId: "e1" },
+				];
+				const ctx = fakeContext({
+					sessionManager: {
+						getSessionId: () => "pi-session-1",
+						getLeafId: () => "e1",
+						getBranch: () => branch,
+						getEntry: (id: string) => branch.find((entry) => entry.id === id),
+					},
+				});
+				await pi.emit("session_start", { type: "session_start" }, ctx);
+				await pi.emit(
+					"before_agent_start",
+					{ type: "before_agent_start", prompt: "why did it fail?", systemPromptOptions: { sections: {} } },
+					ctx,
+				);
+				await pi.emit(
+					"turn_end",
+					{
+						type: "turn_end",
+						messageEntryId: "e1",
+						message: { content: [{ type: "text", text: "done" }] },
+						toolResults: [{ toolCallId: "call-1", isError: false, content: [{ type: "text", text: "ok" }] }],
+						toolResultEntryIds: ["e2"],
+					},
+					ctx,
+				);
+				await new Promise((resolve) => setTimeout(resolve, 30));
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+	const observes = fake.calls.filter((call) => call.url.endsWith("/api/v1/observe")).map((call) => call.body.payload);
+	const tool = observes.find((payload) => payload.source_type === "tool");
+	assert.equal(tool?.source_event_id, "e2");
+	assert.equal("parent_event_id" in (tool ?? {}), false);
+	assert.equal(tool?.sequence, 2);
+	assert.equal(tool?.trace.tool_result_id, "call-1");
+	assert.equal(tool?.trace.projection_id, "projection-1");
+	assert.equal(tool?.payload.parent_entry_id, "e1");
+	const outcome = observes.find((payload) => payload.message_type === "turn.outcome");
+	assert.equal(outcome?.source_event_id, "e1");
+	assert.equal(outcome?.sequence, 1);
+	assert.equal(outcome?.payload.parent_entry_id, "e0");
+	// The outcome event repeats the turn's last tool call so a single event can
+	// carry both the tool result and the outcome (direct attribution).
+	assert.equal(outcome?.trace.tool_result_id, "call-1");
+	assert.equal(outcome?.trace.outcome_id, "e1");
+});

@@ -8,7 +8,6 @@
 
 import { CircuitBreaker } from "./breaker.ts";
 import {
-	ApiError,
 	MemoryClient,
 	type ProjectionResult,
 	type SessionContext,
@@ -26,7 +25,10 @@ export interface SerializedEvent {
 	sourceType: "user" | "agent" | "tool" | "workflow" | "gateway";
 	messageType: string;
 	sequence?: number;
-	parentEventId?: string;
+	/** pi session entry id; travels as the event's `source_event_id`. */
+	entryId?: string;
+	/** pi parent session entry id; kept in the event payload for correlation. */
+	parentEntryId?: string;
 	trace: Trace;
 	payload: Record<string, unknown>;
 	text?: string;
@@ -53,6 +55,8 @@ export interface SessionNote {
 	turnId?: string;
 	entryId?: string;
 	parentEntryId?: string;
+	/** Explicit ordering value; falls back to deriving one from the entry id. */
+	sequence?: number;
 }
 
 export class MemoryBridge {
@@ -194,25 +198,39 @@ export class MemoryBridge {
 		}
 		this.recorded.push(event.idempotencyKey);
 		try {
+			// The observe envelope carries event data in a nested `payload` field;
+			// only the contract fields (source, type, order, parent, trace) live at
+			// the top level. Spreading event data there makes the strict decoder
+			// reject the whole observation as unknown fields.
 			const payload: Record<string, unknown> = {
 				source_type: event.sourceType,
 				message_type: event.messageType,
-				...event.payload,
 			};
 			if (event.sequence !== undefined) {
 				payload.sequence = event.sequence;
 			}
-			if (event.parentEventId) {
-				payload.parent_event_id = event.parentEventId;
+			if (event.entryId) {
+				// `source_event_id` is text and carries the pi entry identity.
+				payload.source_event_id = event.entryId;
 			}
 			if (event.text) {
 				payload.text = event.text;
+			}
+			const data: Record<string, unknown> = { ...event.payload };
+			// `parent_event_id` is a server-side event reference (a uuid), not a pi
+			// entry id; sending an entry id there makes the service reject the
+			// observation. The pi-side causal link is kept in the payload instead.
+			if (event.parentEntryId) {
+				data.parent_entry_id = event.parentEntryId;
 			}
 			// Mark what was injected so the service can tell model output apart
 			// from memory it handed back; without this the memory would be
 			// re-observed and reinforce itself.
 			if (this.injectedMemoryIds.length > 0) {
-				payload.mengpo_injected_memory_ids = [...this.injectedMemoryIds];
+				data.mengpo_injected_memory_ids = [...this.injectedMemoryIds];
+			}
+			if (Object.keys(data).length > 0) {
+				payload.payload = data;
 			}
 			if (Object.keys(event.trace).length > 0) {
 				payload.trace = event.trace;
@@ -249,8 +267,9 @@ export class MemoryBridge {
 			sessionId: this.boundSessionId,
 			sourceType: "tool",
 			messageType: toolResultType(input.isError),
-			sequence: sequenceOf(input.note.entryId),
-			parentEventId: input.note.parentEntryId,
+			sequence: input.note.sequence ?? sequenceOf(input.note.entryId),
+			entryId: input.note.entryId,
+			parentEntryId: input.note.parentEntryId,
 			trace: deriveTrace({
 				taskId: input.note.turnId,
 				attemptId: input.attemptId,
@@ -264,17 +283,19 @@ export class MemoryBridge {
 	}
 
 	/** reportTurnOutcome reports the end of a turn and its outcome identity. */
-	async reportTurnOutcome(input: { note: SessionNote; outcomeId: string; summary: string; failed: boolean }): Promise<void> {
+	async reportTurnOutcome(input: { note: SessionNote; outcomeId: string; summary: string; failed: boolean; lastToolCallId?: string }): Promise<void> {
 		await this.observe({
 			scopeType: "session",
 			sessionId: this.boundSessionId,
 			sourceType: "agent",
 			messageType: EVENT_TYPES.turnOutcome,
-			sequence: sequenceOf(input.note.entryId),
-			parentEventId: input.note.parentEntryId,
+			sequence: input.note.sequence ?? sequenceOf(input.note.entryId),
+			entryId: input.note.entryId,
+			parentEntryId: input.note.parentEntryId,
 			trace: deriveTrace({
 				taskId: input.note.turnId,
 				projectionId: this.currentProjectionId,
+				toolResultId: input.lastToolCallId,
 				outcomeId: input.outcomeId,
 			}),
 			payload: { outcome: input.failed ? "failed" : "completed" },
@@ -384,13 +405,6 @@ export function truncate(text: string, limit: number): string {
 		return text;
 	}
 	return `${text.slice(0, limit)}…`;
-}
-
-export function isDegradableError(error: unknown): boolean {
-	if (error instanceof ApiError) {
-		return true;
-	}
-	return error !== undefined && error !== null;
 }
 
 export type { RecallDecision, ScenarioInput };
