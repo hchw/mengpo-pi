@@ -4,9 +4,15 @@ import test from "node:test";
 import mengpoExtension, { loadUserConfig, USER_CONFIG_PATH } from "../src/extension.ts";
 import { createFetch, defaultServer, jsonResponse } from "./support.ts";
 
+// The developer's real ~/.pi/mengpo.json must never leak into the suite: pin the
+// config path to a nonexistent file. Configured tests supply config through the
+// environment, which takes precedence over the (absent) file anyway.
+process.env.MENGPO_PI_CONFIG = "/nonexistent/mengpo-test-config.json";
+
 interface FakePi {
 	handlers: Map<string, (event: any, ctx: any) => any>;
 	tools: string[];
+	toolDefinitions: Map<string, any>;
 	commands: string[];
 	commandHandlers: Map<string, (args: string, ctx: any) => any>;
 	emit: (name: string, event: any, ctx: any) => Promise<any>;
@@ -15,6 +21,7 @@ interface FakePi {
 function fakePi(): FakePi {
 	const handlers = new Map<string, (event: any, ctx: any) => any>();
 	const tools: string[] = [];
+	const toolDefinitions = new Map<string, any>();
 	const commands: string[] = [];
 	const commandHandlers = new Map<string, (args: string, ctx: any) => any>();
 	const pi = {
@@ -24,6 +31,7 @@ function fakePi(): FakePi {
 		},
 		registerTool: (tool: any) => {
 			tools.push(tool.name);
+			toolDefinitions.set(tool.name, tool);
 		},
 		registerCommand: (name: string, options: any) => {
 			commands.push(name);
@@ -34,6 +42,7 @@ function fakePi(): FakePi {
 	return {
 		handlers,
 		tools,
+		toolDefinitions,
 		commands,
 		commandHandlers,
 		emit: async (name: string, event: any, ctx: any) => {
@@ -81,12 +90,33 @@ function withEnv(values: Record<string, string | undefined>, run: () => Promise<
 test("a missing user configuration file is not an error", () => {
 	assert.deepEqual(loadUserConfig("/nonexistent/mengpo.json"), {});
 	assert.equal(USER_CONFIG_PATH.endsWith("mengpo.json"), true);
+	// MENGPO_PI_CONFIG pins the path for the whole suite, so the developer's real
+	// ~/.pi/mengpo.json cannot make an "unconfigured" test silently configured.
+	assert.deepEqual(loadUserConfig(), {});
 });
 
 test("the extension registers its tools and its command", () => {
 	const pi = fakePi();
 	assert.deepEqual(pi.tools.sort(), ["memory_correct", "memory_forget", "memory_recall", "memory_remember"]);
 	assert.deepEqual(pi.commands, ["memory"]);
+});
+
+test("the memory tools contribute prompt snippets and guidelines so the model knows when to use them", () => {
+	const pi = fakePi();
+	for (const name of ["memory_recall", "memory_remember", "memory_forget", "memory_correct"]) {
+		const tool = pi.toolDefinitions.get(name);
+		assert.ok(tool, `${name} must be registered`);
+		assert.equal(typeof tool.promptSnippet, "string");
+		assert.ok(tool.promptSnippet.length > 0, `${name} must ship a non-empty promptSnippet`);
+		assert.ok(
+			Array.isArray(tool.promptGuidelines) && tool.promptGuidelines.length > 0,
+			`${name} must ship promptGuidelines so the system prompt teaches the trigger`,
+		);
+	}
+	// The remember guidance must state when to write, not just what it does.
+	const remember = pi.toolDefinitions.get("memory_remember");
+	assert.match(remember.description, /durable/i);
+	assert.match(remember.promptGuidelines.join(" "), /same turn/i);
 });
 
 test("the extension opens no connection while loading", async () => {
@@ -126,7 +156,7 @@ test("an unconfigured extension stays inert for the whole session", async () => 
 	}
 });
 
-test("a configured extension binds, injects a prompt section and reports the turn", async () => {
+test("a configured extension binds, injects memory at the request tail and reports the turn", async () => {
 	const fake = createFetch({ handler: defaultServer() });
 	const original = globalThis.fetch;
 	globalThis.fetch = fake.fetch;
@@ -142,14 +172,76 @@ test("a configured extension binds, injects a prompt section and reports the tur
 				const sections: Record<string, string> = {};
 				const event: any = { type: "before_agent_start", prompt: "why did the migration fail?", systemPromptOptions: { sections } };
 				await pi.emit("before_agent_start", event, ctx);
-				assert.ok(sections.mengpo_memory, "the memory section must be appended");
-				assert.match(sections.mengpo_memory, /pgvector keeps the index local/);
-				// The whole prompt must not be replaced.
+				// The system prompt must stay untouched so the cached prefix survives.
+				assert.deepEqual(sections, {});
 				assert.equal(event.systemPrompt, undefined);
+
+				const messages = [{ role: "user", content: [{ type: "text", text: "why did the migration fail?" }], timestamp: 1000 }];
+				const result = await pi.emit("context", { type: "context", messages }, ctx);
+				const parts = result.messages[0].content;
+				assert.match(parts[parts.length - 1].text, /pgvector keeps the index local/);
+				// The injection is request-local: the caller's array is untouched.
+				assert.equal(messages[0].content.length, 1);
 
 				await pi.emit("turn_end", { type: "turn_end", messageEntryId: "0000001a", message: { content: [{ type: "text", text: "done" }] } }, ctx);
 				await new Promise((resolve) => setTimeout(resolve, 20));
 				assert.equal(fake.calls.some((call) => call.url.endsWith("/api/v1/observe")), true);
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+});
+
+test("the tail injection is stable across a tool loop and across turns", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: "dev@mengpo.local" },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext();
+				await pi.emit("session_start", { type: "session_start" }, ctx);
+				await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "what failed?" }, ctx);
+
+				const user = { role: "user", content: "what failed?", timestamp: 1000 };
+				const assistant = { role: "assistant", content: [{ type: "text", text: "checking" }] };
+				const tool = { role: "tool", content: [{ type: "text", text: "result" }] };
+				const first = await pi.emit("context", { type: "context", messages: [user] }, ctx);
+				const firstContent = first.messages[0].content;
+				assert.match(firstContent, /mengpo_memory/);
+
+				// The next request of the same turn has a longer transcript, but the
+				// user message and its injection are byte-identical, so the cached
+				// prefix is reused instead of recomputed.
+				const second = await pi.emit(
+					"context",
+					{ type: "context", messages: [user, assistant, tool] },
+					ctx,
+				);
+				assert.equal(second.messages[0].content, firstContent);
+
+				// A later turn keeps the earlier message's injection (so its prefix is
+				// stable) and gives the new message its own.
+				await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "and now?" }, ctx);
+				const user2 = { role: "user", content: "and now?", timestamp: 2000 };
+				const third = await pi.emit(
+					"context",
+					{ type: "context", messages: [user, assistant, tool, user2] },
+					ctx,
+				);
+				assert.equal(third.messages[0].content, firstContent);
+				assert.match(third.messages[third.messages.length - 1].content, /mengpo_memory/);
+
+				// Applying the same memory to the same message again is a no-op, so a
+				// caller that already carries it is never double-injected.
+				const marked = { role: "user", content: firstContent, timestamp: 1000 };
+				assert.equal(await pi.emit("context", { type: "context", messages: [marked] }, ctx), undefined);
+
+				// The stored message is still the plain user prompt.
+				assert.equal(user.content, "what failed?");
 			},
 		);
 	} finally {
@@ -174,6 +266,7 @@ test("a failing service does not break the session", async () => {
 				const event: any = { type: "before_agent_start", prompt: "hello", systemPromptOptions: { sections } };
 				await pi.emit("before_agent_start", event, ctx);
 				assert.deepEqual(sections, {});
+				assert.equal(await pi.emit("context", { type: "context", messages: [{ role: "user", content: "hello" }] }, ctx), undefined);
 			},
 		);
 	} finally {
@@ -199,6 +292,7 @@ test("session shutdown is idempotent and leaves the extension inert", async () =
 				await pi.emit("before_agent_start", { type: "before_agent_start", prompt: "hi", systemPromptOptions: { sections } }, ctx);
 				assert.equal(fake.calls.length, before);
 				assert.deepEqual(sections, {});
+				assert.equal(await pi.emit("context", { type: "context", messages: [{ role: "user", content: "hi" }] }, ctx), undefined);
 			},
 		);
 	} finally {
@@ -353,4 +447,58 @@ test("reported turn events carry real session entry parents and ordering", async
 	// carry both the tool result and the outcome (direct attribution).
 	assert.equal(outcome?.trace.tool_result_id, "call-1");
 	assert.equal(outcome?.trace.outcome_id, "e1");
+});
+
+test("compaction and branch summaries become session memory boundaries", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: "dev@mengpo.local" },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext();
+				await pi.emit("session_start", { type: "session_start" }, ctx);
+				await pi.emit(
+					"session_compact",
+					{ type: "session_compact", compactionEntry: { id: "cmp-1", summary: "distilled span" }, reason: "threshold" },
+					ctx,
+				);
+				await pi.emit(
+					"session_tree",
+					{ type: "session_tree", summaryEntry: { id: "br-1", summary: "left the branch" } },
+					ctx,
+				);
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+	const observes = fake.calls.filter((call) => call.url.endsWith("/api/v1/observe")).map((call) => call.body.payload);
+	const compaction = observes.find((payload) => payload.message_type === "context.compaction");
+	assert.equal(compaction?.source_type, "workflow");
+	assert.equal(compaction?.text, "distilled span");
+	assert.equal(compaction?.source_event_id, "cmp-1");
+	const branch = observes.find((payload) => payload.message_type === "context.branch_summary");
+	assert.equal(branch?.text, "left the branch");
+});
+
+test("boundary events are ignored before a session is bound", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: undefined, MENGPO_PI_ASSERTION: undefined },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext();
+				await pi.emit("session_compact", { type: "session_compact", compactionEntry: { id: "c", summary: "s" } }, ctx);
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+	assert.equal(fake.calls.length, 0);
 });
