@@ -194,6 +194,45 @@ test("an unbound bridge makes no calls at all", async () => {
 	assert.equal(fake.calls.length, 0);
 });
 
+test("compaction summaries are reported as session boundary events", async () => {
+	const { bridge, fake } = await newBridge();
+	await bridge.reportCompaction({ summary: "  the migration was blocked by a lock  ", entryId: "cmp-1" });
+	const [payload] = observeBodies(fake);
+	assert.equal(payload.source_type, "workflow");
+	assert.equal(payload.message_type, "context.compaction");
+	assert.equal(payload.source_event_id, "cmp-1");
+	assert.equal(payload.text, "the migration was blocked by a lock");
+	assert.equal(payload.payload.context_summary, true);
+	// The summary also travels inside the payload so a deterministic service
+	// can extract it without an LLM prompt.
+	assert.equal(payload.payload.summary, "the migration was blocked by a lock");
+});
+
+test("an explicit remember travels under the session so the owner resolves", async () => {
+	const { bridge, fake } = await newBridge();
+	await bridge.remember("always set GOPROXY", "remember:1");
+	const call = fake.calls.find((entry) => entry.url.endsWith("/api/v1/observe"));
+	assert.equal(call?.body.scope.type, "session");
+	assert.equal(call?.body.scope.session_id, "session-1");
+	assert.equal(call?.body.payload.message_type, "user_remember");
+	assert.equal(call?.body.payload.payload.remember, true);
+	assert.equal(call?.body.payload.payload.text, "always set GOPROXY");
+});
+
+test("branch summaries are reported as session boundary events", async () => {
+	const { bridge, fake } = await newBridge();
+	await bridge.reportBranchSummary({ summary: "switched branches", entryId: "br-1" });
+	const [payload] = observeBodies(fake);
+	assert.equal(payload.message_type, "context.branch_summary");
+	assert.equal(payload.text, "switched branches");
+});
+
+test("an empty boundary summary is not reported", async () => {
+	const { bridge, fake } = await newBridge();
+	await bridge.reportCompaction({ summary: "   " });
+	assert.equal(observeBodies(fake).length, 0);
+});
+
 test("the injection block is wrapped so the transcript can tell it apart", () => {
 	const rendered = renderInjection(["first", "second"]);
 	assert.ok(rendered.startsWith(INJECTION_MARKER));

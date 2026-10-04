@@ -304,14 +304,58 @@ export class MemoryBridge {
 		});
 	}
 
+	/**
+	 * reportCompaction reports a context compaction as a session boundary. The
+	 * runtime has already distilled the span, so the service can extract session
+	 * working memory (and cross-session candidates) immediately instead of
+	 * waiting for the periodic sweep. It is a side channel: failures degrade.
+	 */
+	async reportCompaction(input: { summary: string; entryId?: string }): Promise<void> {
+		await this.reportSessionSummary(EVENT_TYPES.contextCompaction, input);
+	}
+
+	/**
+	 * reportBranchSummary reports a branch summarization as a session boundary.
+	 * It mirrors reportCompaction for /tree navigation.
+	 */
+	async reportBranchSummary(input: { summary: string; entryId?: string }): Promise<void> {
+		await this.reportSessionSummary(EVENT_TYPES.contextBranchSummary, input);
+	}
+
+	private async reportSessionSummary(
+		messageType: string,
+		input: { summary: string; entryId?: string },
+	): Promise<void> {
+		const summary = input.summary.trim();
+		if (summary === "") {
+			return;
+		}
+		await this.observe({
+			scopeType: "session",
+			sessionId: this.boundSessionId,
+			sourceType: "workflow",
+			messageType,
+			entryId: input.entryId,
+			sequence: sequenceOf(input.entryId),
+			trace: deriveTrace({ taskId: this.currentTurnId, projectionId: this.currentProjectionId }),
+			payload: { context_summary: true, summary },
+			text: truncate(summary, 8000),
+			idempotencyKey: `summary:${input.entryId ?? `${messageType}:${this.currentTurnId || "turn"}`}`,
+		});
+	}
+
 	/** remember records an explicit memory instruction. */
 	async remember(text: string, idempotencyKey: string): Promise<void> {
+		// The memory an explicit remember produces is durable and user-scoped, but
+		// the observation itself travels under the session so the service can
+		// resolve which user owns it. Without a session there is no owner.
 		await this.observe({
-			scopeType: "user-global",
+			scopeType: "session",
+			sessionId: this.boundSessionId,
 			sourceType: "user",
 			messageType: EVENT_TYPES.userRemember,
 			trace: deriveTrace({ taskId: this.currentTurnId }),
-			payload: { remember: true },
+			payload: { remember: true, text },
 			text,
 			idempotencyKey,
 		});
