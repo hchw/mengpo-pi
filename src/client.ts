@@ -6,11 +6,16 @@
  * timeout and reports failures as values the caller can ignore.
  */
 
+import { hostname } from "node:os";
+
 import { buildEnvelope, type Envelope, type MemoryHint, type ScopeType } from "./envelope.ts";
 
 export interface ClientOptions {
 	baseUrl: string;
 	assertion: string;
+	agentId?: string;
+	agentSecret?: string;
+	agentUserId?: string;
 	tenantId?: string;
 	timeoutMs?: number;
 	fetchImpl?: typeof fetch;
@@ -82,6 +87,9 @@ export interface FeedbackRequest {
 export class MemoryClient {
 	private readonly baseUrl: string;
 	private readonly assertion: string;
+	private readonly agentId: string;
+	private readonly agentSecret: string;
+	private readonly agentUserId: string;
 	private readonly timeoutMs: number;
 	private readonly fetchImpl: typeof fetch;
 	private readonly now: () => number;
@@ -93,6 +101,9 @@ export class MemoryClient {
 	constructor(options: ClientOptions) {
 		this.baseUrl = options.baseUrl.replace(/\/+$/, "");
 		this.assertion = options.assertion;
+		this.agentId = options.agentId ?? "";
+		this.agentSecret = options.agentSecret ?? "";
+		this.agentUserId = options.agentUserId ?? "";
 		this.configuredTenantId = options.tenantId ?? "";
 		this.timeoutMs = options.timeoutMs ?? 2000;
 		this.fetchImpl = options.fetchImpl ?? fetch;
@@ -106,6 +117,12 @@ export class MemoryClient {
 
 	/** enroll exchanges the assertion for a session and selects a tenant. */
 	async enroll(): Promise<SessionContext> {
+		if (this.agentSecret !== "") {
+			// An agent credential already names its tenant and bound user: there is
+			// no SSO exchange and no session cookie to obtain.
+			this.context = { tenantId: this.configuredTenantId, userId: this.agentUserId, roles: [] };
+			return this.context;
+		}
 		const exchanged = await this.post("/api/v1/auth/sso/exchange", { assertion: this.assertion });
 		const data = exchanged as { user?: { id?: string }; tenants?: Array<{ id?: string; active?: boolean }> };
 		const tenantId = this.configuredTenantId || pickTenant(data.tenants);
@@ -217,11 +234,14 @@ export class MemoryClient {
 		if (operation === "observe" && request.payload?.memory_intent === true) {
 			memoryHint = memoryHint ?? { mode: "auto" };
 		}
+		const agent = this.agentSecret !== "";
 		const envelope = buildEnvelope({
 			tenantId: context.tenantId,
 			userId: context.userId,
-			principalId: context.userId,
-			principalType: "user",
+			// The agent id is only a client label; the service resolves the real
+			// agent from the credential, so a stable host-derived default is fine.
+			principalId: agent ? this.agentId || defaultAgentLabel() : context.userId,
+			principalType: agent ? "agent" : "user",
 			scopeType: request.scopeType,
 			sessionId: request.sessionId,
 			requestId: this.newId(),
@@ -243,7 +263,9 @@ export class MemoryClient {
 		const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 		try {
 			const headers: Record<string, string> = { "Content-Type": "application/json" };
-			if (this.cookie) {
+			if (this.agentSecret !== "") {
+				headers.Authorization = `Bearer ${this.agentSecret}`;
+			} else if (this.cookie) {
 				headers.Cookie = this.cookie;
 			}
 			const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
@@ -285,6 +307,16 @@ export class MemoryClient {
 
 // commandPath maps a command to its route. Session binding lives at the plural
 // collection route; the singular path is reserved for the agent command surface.
+/** defaultAgentLabel names the client without claiming a server-side identity. */
+function defaultAgentLabel(): string {
+	try {
+		const host = hostname().trim();
+		return host === "" ? "mengpo-pi" : `mengpo-pi-${host}`;
+	} catch {
+		return "mengpo-pi";
+	}
+}
+
 function commandPath(operation: "observe" | "project" | "feedback" | "session"): string {
 	return operation === "session" ? "sessions" : operation;
 }

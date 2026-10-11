@@ -34,7 +34,7 @@ export function loadUserConfig(path: string = process.env[USER_CONFIG_ENV] ?? US
 		const raw = readFileSync(path, "utf8");
 		const parsed = JSON.parse(raw) as Record<string, unknown>;
 		const result: Record<string, string> = {};
-		for (const key of ["baseUrl", "assertion", "tenantId", "timeoutMs"]) {
+		for (const key of ["baseUrl", "assertion", "tenantId", "timeoutMs", "agentId", "agentSecret", "agentUserId"]) {
 			const value = parsed[key];
 			if (typeof value === "string") {
 				result[key] = value;
@@ -103,7 +103,7 @@ export default function mengpoExtension(pi: any): void {
 		}
 		if (process.env.MENGPO_PI_DEBUG === "1") {
 			const detail = error instanceof Error ? error.message : String(error ?? "");
-			process.stderr.write(`[mengpo] ${scrub(`${reason} ${detail}`, state.config.assertion)}\n`);
+			process.stderr.write(`[mengpo] ${scrub(`${reason} ${detail}`, state.config.agentSecret || state.config.assertion)}\n`);
 		}
 	};
 
@@ -121,6 +121,9 @@ export default function mengpoExtension(pi: any): void {
 		const client = new MemoryClient({
 			baseUrl: config.baseUrl,
 			assertion: config.assertion,
+			agentId: config.agentId,
+			agentSecret: config.agentSecret,
+			agentUserId: config.agentUserId,
 			tenantId: config.tenantId,
 			timeoutMs: config.timeoutMs,
 		});

@@ -46,3 +46,23 @@ test("a credential never appears verbatim in a redacted value", () => {
 	assert.equal(scrub(`login failed for ${secret}`, secret).includes(secret), false);
 	assert.equal(scrub("nothing to hide", secret), "nothing to hide");
 });
+
+test("agent mode needs only the secret; the service resolves user and tenant", () => {
+	const minimal = resolveAccess({ env: { [ENV_KEYS.baseUrl]: "http://localhost:8080", [ENV_KEYS.agentSecret]: "secret" } });
+	assert.equal(minimal?.mode, "agent");
+	assert.equal(minimal?.agentSecret, "secret");
+	assert.equal(minimal?.agentUserId, "");
+	assert.equal(minimal?.tenantId, "");
+	const explicit = resolveAccess({
+		env: {
+			[ENV_KEYS.baseUrl]: "http://localhost:8080",
+			[ENV_KEYS.agentSecret]: "secret",
+			[ENV_KEYS.agentId]: "agent-1",
+			[ENV_KEYS.agentUser]: "user-1",
+			[ENV_KEYS.tenantId]: "tenant-1",
+		},
+	});
+	assert.equal(explicit?.agentId, "agent-1");
+	assert.equal(explicit?.agentUserId, "user-1");
+	assert.equal(explicit?.tenantId, "tenant-1");
+});
