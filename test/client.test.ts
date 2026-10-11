@@ -198,3 +198,44 @@ test("an authentication failure is an error the caller can classify", async () =
 	});
 	await assert.rejects(() => client.enroll(), (error: unknown) => error instanceof ApiError && error.status === 400);
 });
+
+test("agent mode uses a bearer credential and never exchanges an assertion", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const client = new MemoryClient({
+		baseUrl: "http://memory:8080",
+		assertion: "",
+		agentId: "agent-9",
+		agentSecret: "secret-token",
+		agentUserId: "user-1",
+		tenantId: "tenant-1",
+		fetchImpl: fake.fetch,
+		newId: () => "generated-id",
+	});
+	await client.bindSession("pi-session-1", "demo");
+	assert.deepEqual(fake.paths(), ["/api/v1/sessions"]);
+	const call = fake.calls[0];
+	assert.equal(call?.headers.Authorization, "Bearer secret-token");
+	assert.equal(call?.body.principal.type, "agent");
+	assert.equal(call?.body.principal.id, "agent-9");
+	assert.equal(call?.body.scope.user_id, "user-1");
+	assert.equal(call?.body.scope.tenant_id, "tenant-1");
+});
+
+test("a lone agent secret needs no agent id, user or tenant in the envelope", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const client = new MemoryClient({
+		baseUrl: "http://memory:8080",
+		assertion: "",
+		agentSecret: "secret-token",
+		fetchImpl: fake.fetch,
+		newId: () => "generated-id",
+	});
+	await client.bindSession("pi-session-1", "demo");
+	assert.deepEqual(fake.paths(), ["/api/v1/sessions"]);
+	const call = fake.calls[0];
+	assert.equal(call?.headers.Authorization, "Bearer secret-token");
+	assert.equal(call?.body.principal.type, "agent");
+	assert.match(String(call?.body.principal.id), /^mengpo-pi/);
+	assert.equal(call?.body.scope.tenant_id, "");
+	assert.equal(call?.body.scope.user_id, "");
+});

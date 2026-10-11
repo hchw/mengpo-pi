@@ -7,7 +7,13 @@
 
 export interface AccessConfig {
 	baseUrl: string;
+	// "user" authenticates with an SSO assertion; "agent" uses a registered
+	// agent credential and never performs an SSO exchange.
+	mode: "user" | "agent";
 	assertion: string;
+	agentId?: string;
+	agentSecret?: string;
+	agentUserId?: string;
 	tenantId: string;
 	timeoutMs: number;
 	cookieName?: string;
@@ -21,6 +27,9 @@ export interface ConfigSource {
 export const ENV_KEYS = {
 	baseUrl: "MENGPO_PI_BASE_URL",
 	assertion: "MENGPO_PI_ASSERTION",
+	agentId: "MENGPO_PI_AGENT_ID",
+	agentSecret: "MENGPO_PI_AGENT_SECRET",
+	agentUser: "MENGPO_PI_USER_ID",
 	tenantId: "MENGPO_PI_TENANT",
 	timeoutMs: "MENGPO_PI_TIMEOUT_MS",
 } as const;
@@ -37,15 +46,36 @@ export function resolveAccess(source: ConfigSource = {}): AccessConfig | undefin
 	const env = source.env ?? {};
 	const file = source.file ?? {};
 	const baseUrl = (env[ENV_KEYS.baseUrl] ?? file.baseUrl ?? "").trim();
+	const timeoutMs = resolveTimeout(env[ENV_KEYS.timeoutMs] ?? file.timeoutMs);
+	if (baseUrl === "") {
+		return undefined;
+	}
+	const agentSecret = (env[ENV_KEYS.agentSecret] ?? file.agentSecret ?? "").trim();
+	if (agentSecret !== "") {
+		// The secret alone is enough: the service resolves the agent, its bound
+		// user and its tenant. The optional fields only narrow the choice when an
+		// agent is bound to more than one user or tenant.
+		return {
+			baseUrl: normalizeBaseUrl(baseUrl),
+			mode: "agent",
+			assertion: "",
+			agentId: (env[ENV_KEYS.agentId] ?? file.agentId ?? "").trim(),
+			agentSecret,
+			agentUserId: (env[ENV_KEYS.agentUser] ?? file.agentUserId ?? "").trim(),
+			tenantId: (env[ENV_KEYS.tenantId] ?? file.tenantId ?? "").trim(),
+			timeoutMs,
+		};
+	}
 	const assertion = (env[ENV_KEYS.assertion] ?? file.assertion ?? "").trim();
-	if (baseUrl === "" || assertion === "") {
+	if (assertion === "") {
 		return undefined;
 	}
 	return {
 		baseUrl: normalizeBaseUrl(baseUrl),
+		mode: "user",
 		assertion,
 		tenantId: (env[ENV_KEYS.tenantId] ?? file.tenantId ?? "").trim(),
-		timeoutMs: resolveTimeout(env[ENV_KEYS.timeoutMs] ?? file.timeoutMs),
+		timeoutMs,
 	};
 }
 

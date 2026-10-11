@@ -44,11 +44,19 @@ pi -e /path/to/mengpo-pi
 | 环境变量 | 说明 |
 | --- | --- |
 | `MENGPO_PI_BASE_URL` | Mengpo 服务地址，例如 `http://localhost:8080` |
-| `MENGPO_PI_ASSERTION` | 会话断言（开发环境即以已验证邮箱作为断言） |
-| `MENGPO_PI_TENANT` | 租户标识；省略时自动选择第一个可访问租户 |
+| `MENGPO_PI_ASSERTION` | 用户模式必填：会话断言（开发环境即以已验证邮箱作为断言） |
+| `MENGPO_PI_AGENT_SECRET` | 智能体模式必填：控制台「成员与智能体」创建智能体时返回的一次性密钥 |
+| `MENGPO_PI_AGENT_ID` | 可选：客户端标签（默认 `mengpo-pi-<主机名>`），仅用于声明，不参与鉴权 |
+| `MENGPO_PI_USER_ID` | 可选：当智能体绑定了多个用户时，指定以哪个用户身份读写 |
+| `MENGPO_PI_TENANT` | 可选：默认由智能体凭据反查其所属租户；用户模式省略则自动选第一个可访问租户 |
 | `MENGPO_PI_TIMEOUT_MS` | 单次调用超时，默认 2000，上限 30000 |
 | `MENGPO_PI_DEBUG` | 设为 `1` 时把降级原因写到 stderr（凭据始终被脱敏） |
 | `MENGPO_PI_CONFIG` | 覆盖用户配置文件路径（默认 `~/.pi/mengpo.json`）；设为空路径即禁用文件配置 |
+
+两种接入模式：
+
+- **用户模式**：配置 `MENGPO_PI_ASSERTION`，走 SSO exchange 换取会话 cookie；
+- **智能体模式**：只需配置 `MENGPO_PI_AGENT_SECRET`，每次请求用 `Authorization: Bearer <secret>`，不进行 SSO exchange。服务端由密钥反查智能体 → 绑定的用户 → 所属租户；当智能体只绑定一个用户时，`MENGPO_PI_USER_ID` / `MENGPO_PI_TENANT` / `MENGPO_PI_AGENT_ID` 都无需配置。智能体会出现在控制台成员页的「智能体」列表。
 
 也可以写在 `~/.pi/mengpo.json`：
 
@@ -60,7 +68,18 @@ pi -e /path/to/mengpo-pi
 }
 ```
 
-环境变量优先于文件。**两个必填项（地址与断言）任一为空时，扩展完全惰性**：不发起任何调用，也不在每轮重复尝试——那是"未接入"，不是"服务不可用"。
+智能体模式示例（最小配置）：
+
+```json
+{
+  "baseUrl": "http://localhost:8080",
+  "agentSecret": "<one-time-secret>"
+}
+```
+
+仅当智能体绑定多个用户时，才需要额外指定 `agentUserId`。
+
+环境变量优先于文件。**缺少所需凭据时，扩展完全惰性**：不发起任何调用，也不在每轮重复尝试——那是"未接入"，不是"服务不可用"。
 
 ### 运行提示
 
