@@ -1,4 +1,8 @@
-# Mengpo Pi · 记忆适配器
+<p align="center">
+  <img src="https://raw.githubusercontent.com/hchw/mengpo/main/web/mengpotang.png" alt="Mengpo" width="660">
+</p>
+
+<h1 align="center">Mengpo Pi · 记忆适配器</h1>
 
 把 [Mengpo](https://github.com/hchw/mengpo) 记忆服务接到 [pi](https://github.com/earendil-works/pi) 编码智能体上的扩展，让 pi 在会话中拥有跨会话、可治理、可追溯的长期记忆。
 
@@ -9,6 +13,8 @@ pi 每次新会话都从零开始：项目约定、踩过的坑、上次为什�
 Mengpo 是一个独立的记忆服务：租户级物理隔离、治理状态机、证据与置信度、可解释的混合召回与投影预算。本扩展负责把 pi 接上去。
 
 pi 不是"主流聊天 Agent"，而是编码智能体：它原生带有工具调用标识、会话条目的树形结构、重试与测试结果。因此本扩展以 **Level 2 深度 Runtime Adapter** 的方式接入——不只是旁观消息，而是把「哪次投影、用了哪些记忆、哪次工具调用、哪个结局」串成一条可归因的链路。
+
+> ⚠️ **使用前提：必须先安装并运行 [Mengpo](https://github.com/hchw/mengpo)。** 本扩展只是 pi 侧的适配器，自身不存储任何记忆；没有 Mengpo，扩展会完全惰性、不发起任何调用，pi 也不会有跨会话记忆。安装与接入步骤见下方「前置条件」。
 
 ## 功能
 
@@ -21,9 +27,93 @@ pi 不是"主流聊天 Agent"，而是编码智能体：它原生带有工具调
 - **反馈回传**：纠正与显式反馈关联到具体记忆；拿不到目标时不上报伪造标识。
 - **降级可用**：未配置接入时不发起任何调用；已配置但不可用时静默降级并熔断（连续失败后停止重试）。记忆功能不会阻塞会话，也不会成为延迟来源。
 
+## 前置条件：必须先安装并运行 Mengpo
+
+本扩展只是 **pi 侧的适配器**，不存储任何记忆。没有 Mengpo 服务，扩展不会发起任何调用（完全惰性），pi 也就没有跨会话记忆。**使用前请务必先把 Mengpo 跑起来。**
+
+### 第 1 步：安装 Mengpo
+
+三种方式，任选其一：
+
+**方式一：Docker Compose 一键环境（推荐，自带 PostgreSQL + pgvector、API、Worker、Console）**
+
+```bash
+git clone https://github.com/hchw/mengpo.git
+cd mengpo
+make dev          # 构建并启动全部服务
+make dev-logs     # 查看日志
+make dev-down     # 停止并清空数据卷
+```
+
+启动后：
+
+- Memory API：`http://localhost:8080`
+- 健康检查：`GET http://localhost:8080/healthz`
+- React Console：`http://localhost:5173`
+- 开发环境会自动初始化账号：`dev@mengpo.local` / `dev-password`
+
+**方式二：本地运行服务（已有 PostgreSQL + pgvector）**
+
+```bash
+cp .env.example .env         # 按需修改配置
+# 至少配置 DATABASE_URL；详情见 mengpo 的 .env.example
+go build ./...
+go run ./cmd/memory-server   # HTTP API
+go run ./cmd/memory-worker   # 异步 Worker（分析、embedding、调度）
+```
+
+Mengpo 要求 PostgreSQL + pgvector 扩展，租户数据按 schema 物理隔离。默认所有外部 Provider（Embedding / Memory LLM / Reranker）关闭，服务以规则/结构化路径降级运行；需要模型能力时按 `.env.example` 开启。
+
+**方式三：接入已有实例**
+
+如果团队已经部署了 Mengpo，只要拿到一个可访问的地址（例如 `https://memory.example.com`），直接跳到第 2 步。
+
+### 第 2 步：把 pi 接入 Mengpo
+
+先让 `MENGPO_PI_BASE_URL` 指向 Mengpo，然后二选一取得凭据。
+
+**A. 智能体模式（推荐）**
+
+1. 打开 Console（默认 `http://localhost:5173`），用 `dev@mengpo.local` / `dev-password` 登录；
+2. 进入「成员与智能体」，新建智能体，勾选 allowed scopes（`user-global`、`session`）与 capabilities（至少 `observe`、`project`、`feedback`；需要会话工作记忆再加 `session`，需要触发固化再加 `consolidate`）；
+3. 创建后返回**一次性密钥**（只显示一次，请立即保存）；
+4. 写成配置：
+
+```json
+// ~/.pi/mengpo.json
+{
+  "baseUrl": "http://localhost:8080",
+  "agentSecret": "<one-time-secret>"
+}
+```
+
+智能体只绑定一个用户时，不必再配 `agentUserId` / `tenantId` / `agentId`；服务端会由密钥反查智能体 → 绑定的用户 → 所属租户。
+
+**B. 用户模式（使用已有账号的会话断言）**
+
+```json
+// ~/.pi/mengpo.json
+{
+  "baseUrl": "http://localhost:8080",
+  "assertion": "dev@mengpo.local"
+}
+```
+
+开发环境以已验证邮箱作为断言；生产环境走 Mengpo 的 SSO exchange 换取会话 cookie。所有字段也可用环境变量提供（环境变量优先），对应关系见「配置」表。
+
+### 第 3 步：验证接入
+
+在 pi 中加载扩展后执行：
+
+```text
+/memory
+```
+
+应显示已接入及当前租户/用户；之后召回时会打印 `mengpo: 记忆获取 N 条 …` 与 `mengpo: 记忆注入 N 条`。若显示未接入，通常是 `MENGPO_PI_BASE_URL` 或凭据未配置，可对照下方「降级与熔断」表排查。
+
 ## 使用方法
 
-### 前置依赖
+### 版本兼容
 
 需要 Mengpo 侧的 **`memory-level2-ingress`** 变更**先行发布**：它提供 `observe` 的来源/事件类型/顺序/trace 字段、`project` 的 `projection_id`，以及 `project` 的场景信号入口。
 
