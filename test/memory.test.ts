@@ -248,3 +248,92 @@ test("sequence and truncation helpers stay bounded", () => {
 	assert.equal(truncate("short", 10), "short");
 	assert.equal(truncate("0123456789", 4), "0123…");
 });
+
+async function newGatedBridge(capabilities: string[], handler = defaultServer()) {
+	const fake = createFetch({ handler: (path: string, call: RecordedCall) => handler(path, call) });
+	const client = new MemoryClient({
+		baseUrl: "http://memory:8080",
+		assertion: "dev@mengpo.local",
+		timeoutMs: 500,
+		fetchImpl: fake.fetch,
+		newId: () => "generated-id",
+	});
+	const breaker = new CircuitBreaker({ failureThreshold: 2, cooldownMs: 1000, now: () => 0 });
+	const bridge = new MemoryBridge({ client, breaker, capabilities: new Set(capabilities) });
+	await bridge.bind("pi-session-1", "demo");
+	return { bridge, fake, breaker };
+}
+
+test("an agent without the session capability does not bind", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const client = new MemoryClient({ baseUrl: "http://memory:8080", assertion: "a", fetchImpl: fake.fetch });
+	const bridge = new MemoryBridge({ client, capabilities: new Set(["observe", "project"]) });
+	assert.equal(await bridge.bind("pi-session-1", "demo"), false);
+	assert.equal(bridge.sessionId, "");
+	assert.equal(fake.calls.length, 0);
+});
+
+test("operations without their capability are skipped", async () => {
+	const { bridge, fake } = await newGatedBridge(["session", "project"]);
+	await bridge.observe({
+		scopeType: "session",
+		sessionId: bridge.sessionId,
+		sourceType: "tool",
+		messageType: "tool.result",
+		trace: {},
+		payload: {},
+		idempotencyKey: "k1",
+	});
+	assert.equal(fake.calls.some((call) => call.url.endsWith("/api/v1/observe")), false);
+	assert.equal(await bridge.feedback("memory-1", "corrected", "x", "k2"), false);
+	assert.equal(fake.calls.some((call) => call.url.endsWith("/api/v1/feedback")), false);
+	bridge.beginTurn({ turnId: "turn-1" });
+	const outcome = await bridge.recall({ hasNewUserInput: true, query: "q" });
+	assert.equal(outcome.itemCount, 1, "a granted project capability still recalls");
+});
+
+test("a capability denial does not trip the breaker and is not retried", async () => {
+	let attempts = 0;
+	const { bridge, breaker } = await newGatedBridge(["session", "observe"], (path, call) => {
+		if (path === "/api/v1/observe") {
+			attempts += 1;
+			return jsonResponse({ status: 403, error: { code: "CAPABILITY_DENIED", message: "no" } });
+		}
+		return defaultServer()(path, call);
+	});
+	for (let i = 0; i < 5; i += 1) {
+		await bridge.observe({
+			scopeType: "session",
+			sessionId: bridge.sessionId,
+			sourceType: "tool",
+			messageType: "tool.result",
+			trace: {},
+			payload: {},
+			idempotencyKey: `k-${i}`,
+		});
+	}
+	assert.equal(attempts, 1, "a permission denial is remembered, not retried");
+	assert.equal(breaker.isOpen(), false, "a permission denial must not open the breaker");
+});
+
+test("a denied capability leaves other operations working", async () => {
+	const { bridge, fake } = await newGatedBridge(["session", "observe", "project"], (path, call) => {
+		if (path === "/api/v1/observe") {
+			return jsonResponse({ status: 403, error: { code: "CAPABILITY_DENIED", message: "no" } });
+		}
+		return defaultServer()(path, call);
+	});
+	await bridge.observe({
+		scopeType: "session",
+		sessionId: bridge.sessionId,
+		sourceType: "tool",
+		messageType: "tool.result",
+		trace: {},
+		payload: {},
+		idempotencyKey: "k1",
+	});
+	bridge.beginTurn({ turnId: "turn-1" });
+	const outcome = await bridge.recall({ hasNewUserInput: true, query: "q" });
+	assert.equal(outcome.itemCount, 1);
+	assert.equal(fake.calls.some((call) => call.url.endsWith("/api/v1/project")), true);
+});

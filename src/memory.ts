@@ -8,6 +8,7 @@
 
 import { CircuitBreaker } from "./breaker.ts";
 import {
+	isPermissionDenied,
 	MemoryClient,
 	type ProjectionResult,
 	type SessionContext,
@@ -46,6 +47,12 @@ export interface RecallOutcome {
 export interface BridgeDeps {
 	client: MemoryClient;
 	breaker?: CircuitBreaker;
+	/**
+	 * Capabilities granted to the credential. Undefined means "unknown": every
+	 * operation is attempted, which is how user mode and older servers stay
+	 * working.
+	 */
+	capabilities?: ReadonlySet<string>;
 	/** Reports a degraded operation without ever throwing. */
 	onDegrade?: (reason: string, error?: unknown) => void;
 }
@@ -63,6 +70,8 @@ export class MemoryBridge {
 	private readonly client: MemoryClient;
 	private readonly breaker: CircuitBreaker;
 	private readonly onDegrade: (reason: string, error?: unknown) => void;
+	private readonly granted: ReadonlySet<string> | undefined;
+	private readonly denied = new Set<string>();
 	private boundSessionId = "";
 	private currentTurnId = "";
 	private lastInjectionTurnId: string | undefined;
@@ -76,6 +85,34 @@ export class MemoryBridge {
 		this.client = deps.client;
 		this.breaker = deps.breaker ?? new CircuitBreaker();
 		this.onDegrade = deps.onDegrade ?? (() => {});
+		this.granted = deps.capabilities;
+	}
+
+	/**
+	 * can reports whether an operation is currently allowed. An unknown grant set
+	 * is treated as allowed; a capability the service explicitly denied stays
+	 * denied for the rest of the session.
+	 */
+	private can(capability: string): boolean {
+		if (this.denied.has(capability)) {
+			return false;
+		}
+		return this.granted === undefined || this.granted.has(capability);
+	}
+
+	/**
+	 * recordFailure classifies an error. A capability denial is permanent: it is
+	 * remembered and never trips the breaker. Anything else is transient.
+	 * Returns true when the error was a capability denial.
+	 */
+	private recordFailure(capability: string, error: unknown): boolean {
+		if (isPermissionDenied(error)) {
+			this.denied.add(capability);
+			this.onDegrade(`${capability} not granted`, error);
+			return true;
+		}
+		this.breaker.recordFailure();
+		return false;
 	}
 
 	get sessionId(): string {
@@ -100,7 +137,7 @@ export class MemoryBridge {
 
 	/** bind establishes the session binding. Failure leaves the session usable. */
 	async bind(externalId: string, title: string): Promise<boolean> {
-		if (!this.breaker.allows()) {
+		if (!this.can("session") || !this.breaker.allows()) {
 			return false;
 		}
 		try {
@@ -109,8 +146,9 @@ export class MemoryBridge {
 			this.breaker.recordSuccess();
 			return true;
 		} catch (error) {
-			this.breaker.recordFailure();
-			this.onDegrade("session binding failed", error);
+			if (!this.recordFailure("session", error)) {
+				this.onDegrade("session binding failed", error);
+			}
 			return false;
 		}
 	}
@@ -143,6 +181,9 @@ export class MemoryBridge {
 		if (!decided.recall) {
 			return { decided, itemCount: 0 };
 		}
+		if (!this.can("project")) {
+			return { decided, itemCount: 0 };
+		}
 		if (this.boundSessionId === "") {
 			return { decided, itemCount: 0 };
 		}
@@ -172,8 +213,9 @@ export class MemoryBridge {
 				itemCount: projection.items.length,
 			};
 		} catch (error) {
-			this.breaker.recordFailure();
-			this.onDegrade("recall failed", error);
+			if (!this.recordFailure("project", error)) {
+				this.onDegrade("recall failed", error);
+			}
 			return { decided, itemCount: 0 };
 		}
 	}
@@ -190,7 +232,7 @@ export class MemoryBridge {
 	 * and never throws: reporting is a side channel.
 	 */
 	async observe(event: SerializedEvent): Promise<void> {
-		if (this.boundSessionId === "" || !this.breaker.allows()) {
+		if (!this.can("observe") || this.boundSessionId === "" || !this.breaker.allows()) {
 			return;
 		}
 		if (this.recorded.includes(event.idempotencyKey)) {
@@ -243,8 +285,9 @@ export class MemoryBridge {
 			});
 			this.breaker.recordSuccess();
 		} catch (error) {
-			this.breaker.recordFailure();
-			this.onDegrade("observation report failed", error);
+			if (!this.recordFailure("observe", error)) {
+				this.onDegrade("observation report failed", error);
+			}
 		}
 	}
 
@@ -380,7 +423,7 @@ export class MemoryBridge {
 	 * would be worse than no feedback at all.
 	 */
 	async feedback(memoryId: string, type: string, reason: string, idempotencyKey: string): Promise<boolean> {
-		if (this.boundSessionId === "" || memoryId.trim() === "" || !this.breaker.allows()) {
+		if (!this.can("feedback") || this.boundSessionId === "" || memoryId.trim() === "" || !this.breaker.allows()) {
 			return false;
 		}
 		try {
@@ -395,15 +438,16 @@ export class MemoryBridge {
 			this.breaker.recordSuccess();
 			return true;
 		} catch (error) {
-			this.breaker.recordFailure();
-			this.onDegrade("feedback failed", error);
+			if (!this.recordFailure("feedback", error)) {
+				this.onDegrade("feedback failed", error);
+			}
 			return false;
 		}
 	}
 
 	/** recallNow serves the explicit, model-initiated recall tool. */
 	async recallNow(query: string, idempotencyKey: string): Promise<ProjectionResult | undefined> {
-		if (this.boundSessionId === "" || !this.breaker.allows()) {
+		if (!this.can("project") || this.boundSessionId === "" || !this.breaker.allows()) {
 			return undefined;
 		}
 		try {
@@ -417,8 +461,9 @@ export class MemoryBridge {
 			this.breaker.recordSuccess();
 			return projection;
 		} catch (error) {
-			this.breaker.recordFailure();
-			this.onDegrade("explicit recall failed", error);
+			if (!this.recordFailure("project", error)) {
+				this.onDegrade("explicit recall failed", error);
+			}
 			return undefined;
 		}
 	}

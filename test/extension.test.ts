@@ -502,3 +502,74 @@ test("boundary events are ignored before a session is bound", async () => {
 	}
 	assert.equal(fake.calls.length, 0);
 });
+
+test("agent mode discovers capabilities before binding", async () => {
+	const fake = createFetch({
+		handler: (path, call) =>
+			path === "/api/v1/agent/handshake"
+				? jsonResponse({ data: { allowed_capabilities: ["observe", "project", "feedback", "session", "consolidate"] } })
+				: defaultServer()(path, call),
+	});
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: undefined, MENGPO_PI_AGENT_SECRET: "secret-token" },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext();
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+				const handshake = fake.calls.findIndex((call) => call.url.endsWith("/api/v1/agent/handshake"));
+				const sessions = fake.calls.findIndex((call) => call.url.endsWith("/api/v1/sessions"));
+				assert.notEqual(handshake, -1, "agent mode must negotiate capabilities");
+				assert.notEqual(sessions, -1, "binding must still happen");
+				assert.ok(handshake < sessions, "discovery must precede binding");
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+});
+
+test("user mode never negotiates capabilities", async () => {
+	const fake = createFetch({ handler: defaultServer() });
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: "dev@mengpo.local", MENGPO_PI_AGENT_SECRET: undefined },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext();
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+	assert.equal(fake.calls.some((call) => call.url.endsWith("/api/v1/agent/handshake")), false);
+});
+
+test("a failing discovery does not block the session", async () => {
+	const fake = createFetch({
+		handler: (path, call) =>
+			path === "/api/v1/agent/handshake"
+				? jsonResponse({ status: 404, error: { code: "NOT_FOUND", message: "no endpoint" } })
+				: defaultServer()(path, call),
+	});
+	const original = globalThis.fetch;
+	globalThis.fetch = fake.fetch;
+	try {
+		await withEnv(
+			{ MENGPO_PI_BASE_URL: "http://memory:8080", MENGPO_PI_ASSERTION: undefined, MENGPO_PI_AGENT_SECRET: "secret-token" },
+			async () => {
+				const pi = fakePi();
+				const ctx = fakeContext();
+				await pi.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+				assert.equal(fake.calls.some((call) => call.url.endsWith("/api/v1/sessions")), true);
+			},
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ApiError, MemoryClient } from "../src/client.ts";
+import { ApiError, isPermissionDenied, MemoryClient } from "../src/client.ts";
 import { createFetch, defaultServer, jsonResponse } from "./support.ts";
 
 function newClient(plan: Parameters<typeof createFetch>[0]) {
@@ -238,4 +238,72 @@ test("a lone agent secret needs no agent id, user or tenant in the envelope", as
 	assert.match(String(call?.body.principal.id), /^mengpo-pi/);
 	assert.equal(call?.body.scope.tenant_id, "");
 	assert.equal(call?.body.scope.user_id, "");
+});
+
+test("agent mode discovers its granted capabilities with a bearer credential", async () => {
+	const fake = createFetch({
+		handler: (path, call) =>
+			path === "/api/v1/agent/handshake"
+				? jsonResponse({
+						data: {
+							protocol_version: "memory.v1",
+							allowed_capabilities: ["observe", "project"],
+							allowed_scope_types: ["user-global", "session"],
+							allowed_session_ids: ["s1"],
+							max_payload: 1048576,
+							privacy_policy: "tenant-policy",
+						},
+					})
+				: defaultServer()(path, call),
+	});
+	const client = new MemoryClient({ baseUrl: "http://memory:8080", assertion: "", agentSecret: "secret-token", fetchImpl: fake.fetch });
+	const discovery = await client.discoverCapabilities();
+	assert.deepEqual(discovery?.allowedCapabilities, ["observe", "project"]);
+	assert.equal(discovery?.maxPayload, 1048576);
+	assert.equal(discovery?.privacyPolicy, "tenant-policy");
+	const call = fake.calls[0];
+	assert.equal(call?.headers.Authorization, "Bearer secret-token");
+	assert.equal(call?.body.protocol_version, "memory.v1");
+	assert.equal(call?.body.scope_type, "user-global");
+});
+
+test("user mode does not negotiate capabilities", async () => {
+	const { client, fake } = newClient({ handler: defaultServer() });
+	assert.equal(await client.discoverCapabilities(), undefined);
+	assert.equal(fake.calls.length, 0);
+});
+
+test("a missing or failing discovery degrades to undefined", async () => {
+	for (const status of [404, 401]) {
+		const fake = createFetch({
+			handler: (path, call) =>
+				path === "/api/v1/agent/handshake" ? jsonResponse({ status, error: { code: "X", message: "no" } }) : defaultServer()(path, call),
+		});
+		const client = new MemoryClient({ baseUrl: "http://memory:8080", assertion: "", agentSecret: "s", fetchImpl: fake.fetch });
+		assert.equal(await client.discoverCapabilities(), undefined);
+	}
+	const failing = createFetch({
+		handler: (path) => (path === "/api/v1/agent/handshake" ? (Promise.reject(new Error("aborted")) as any) : jsonResponse({})),
+	});
+	const client = new MemoryClient({ baseUrl: "http://memory:8080", assertion: "", agentSecret: "s", fetchImpl: failing.fetch });
+	assert.equal(await client.discoverCapabilities(), undefined);
+});
+
+test("a capability denial is classified separately from a transient failure", async () => {
+	const { client } = newClient({
+		handler: (path, call) =>
+			path === "/api/v1/observe"
+				? jsonResponse({ status: 403, error: { code: "CAPABILITY_DENIED", message: "capability observe is not granted" } })
+				: defaultServer()(path, call),
+	});
+	await client.bindSession("pi-session-1", "demo");
+	try {
+		await client.observe({ scopeType: "session", sessionId: "session-1", idempotencyKey: "k", payload: {} });
+		assert.fail("expected rejection");
+	} catch (error) {
+		assert.ok(error instanceof ApiError);
+		assert.equal(error.permissionDenied, true);
+		assert.equal(isPermissionDenied(error), true);
+	}
+	assert.equal(isPermissionDenied(new ApiError({ code: "INTERNAL", message: "boom", status: 500 })), false);
 });

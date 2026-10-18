@@ -39,12 +39,31 @@ export class ApiError extends Error {
 		this.code = failure.code;
 		this.status = failure.status;
 	}
+
+	/** permissionDenied reports a capability denial that retrying can never fix. */
+	get permissionDenied(): boolean {
+		return this.code === "CAPABILITY_DENIED";
+	}
+}
+
+/** isPermissionDenied classifies an error as a stable capability denial. */
+export function isPermissionDenied(error: unknown): boolean {
+	return error instanceof ApiError && error.permissionDenied;
 }
 
 export interface SessionContext {
 	tenantId: string;
 	userId: string;
 	roles: string[];
+}
+
+/** CapabilityDiscovery is what the service reports a credential may do. */
+export interface CapabilityDiscovery {
+	allowedCapabilities: string[];
+	allowedScopeTypes: string[];
+	allowedSessionIds: string[];
+	maxPayload: number;
+	privacyPolicy: string;
 }
 
 export interface ObserveRequest {
@@ -148,6 +167,39 @@ export class MemoryClient {
 			return this.context;
 		}
 		return this.enroll();
+	}
+
+	/**
+	 * discoverCapabilities asks the service which capabilities this credential
+	 * holds. Only agent-mode callers negotiate; user mode (no agent credential)
+	 * and servers without the endpoint return undefined, so the caller keeps its
+	 * previous behaviour instead of guessing.
+	 */
+	async discoverCapabilities(): Promise<CapabilityDiscovery | undefined> {
+		if (this.agentSecret === "") {
+			return undefined;
+		}
+		try {
+			const data = (await this.request("/api/v1/agent/handshake", {
+				protocol_version: "memory.v1",
+				scope_type: "user-global",
+			})) as {
+				allowed_capabilities?: string[];
+				allowed_scope_types?: string[];
+				allowed_session_ids?: string[];
+				max_payload?: number;
+				privacy_policy?: string;
+			};
+			return {
+				allowedCapabilities: data.allowed_capabilities ?? [],
+				allowedScopeTypes: data.allowed_scope_types ?? [],
+				allowedSessionIds: data.allowed_session_ids ?? [],
+				maxPayload: data.max_payload ?? 0,
+				privacyPolicy: data.privacy_policy ?? "",
+			};
+		} catch {
+			return undefined;
+		}
 	}
 
 	async bindSession(externalId: string, title: string): Promise<string> {

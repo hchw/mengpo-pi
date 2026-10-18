@@ -127,7 +127,19 @@ export default function mengpoExtension(pi: any): void {
 			tenantId: config.tenantId,
 			timeoutMs: config.timeoutMs,
 		});
-		const bridge = new MemoryBridge({ client, breaker: new CircuitBreaker(), onDegrade: note });
+		// Capability discovery is agent-mode only; user mode and servers without the
+		// endpoint return undefined, so the bridge treats capabilities as unknown
+		// and attempts its operations as before.
+		let capabilities: ReadonlySet<string> | undefined;
+		try {
+			const discovered = await client.discoverCapabilities();
+			if (discovered) {
+				capabilities = new Set(discovered.allowedCapabilities);
+			}
+		} catch (error) {
+			note("capability discovery failed", error);
+		}
+		const bridge = new MemoryBridge({ client, breaker: new CircuitBreaker(), onDegrade: note, capabilities });
 		state = { config, client, bridge };
 		const externalId = safeSessionId(ctx);
 		try {
